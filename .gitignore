@@ -1,0 +1,6 @@
+.vscode
+build
+debug
+token
+*.mp4
+.DS_Store
