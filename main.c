@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h> // Include string.h for strcpy
 
 #include <curl/curl.h>
 #include <json-c/json.h>
@@ -36,6 +37,11 @@ void context_free() {
   arena_free(context_arena);
 }
 
+void *context_realloc(void *ptr, size_t old_size, size_t new_size) {
+  assert(context_arena);
+  return arena_realloc(context_arena, ptr, old_size, new_size);
+}
+
 const char *method_url(const char *method, const char *params) {
   char *url =
       context_alloc(API_URL_LENGTH + strlen(method) + strlen(params) + 1);
@@ -45,24 +51,68 @@ const char *method_url(const char *method, const char *params) {
 
 static uint64_t offset = 0;
 
-void log_callback(char *ptr, size_t size, size_t nmemb, void *userdata) {
-  fwrite(ptr, 1, size * nmemb, stdout);
+void log_callback(char *ptr, size_t size) {
+  fwrite(ptr, size, 1, stdout);
   puts("");
+}
+
+// Function to extract width and height using ffprobe
+void get_video_dimensions(const char *video_file, int *width, int *height) {
+  char command[512];
+  snprintf(command, sizeof(command),
+           "ffprobe -v error -show_entries stream=width,height -of "
+           "default=noprint_wrappers=1:nokey=1 %s",
+           video_file);
+
+  FILE *fp = popen(command, "r");
+  if (fp == NULL) {
+    perror("Failed to run ffprobe");
+    *width = 0;
+    *height = 0;
+    return;
+  }
+
+  if (fscanf(fp, "%d\n%d", width, height) != 2) {
+    fprintf(stderr, "Failed to parse ffprobe output\n");
+    *width = 0;
+    *height = 0;
+    pclose(fp);
+    return;
+  }
+
+  pclose(fp);
 }
 
 void handle_url(const char *url, Message *message) {
   const char *last_slash = strrchr(url, '/');
   const char *filename = last_slash ? last_slash + 1 : url;
+
+  // Get the YT_DLP_OUTPUT environment variable
+  const char *output_dir = getenv("YT_DLP_OUTPUT");
+  if (output_dir == NULL) {
+    output_dir = "/downloads"; // Default if not set
+  }
+
+  // Construct the full output path
+  size_t output_path_size =
+      strlen(output_dir) + strlen("/") + strlen(filename) + strlen(".mp4") + 1;
+  char *output_path = context_alloc(output_path_size);
+  snprintf(output_path, output_path_size, "%s/%s.mp4", output_dir, filename);
+
+  // Construct the yt-dlp command
   size_t command_size =
-      strlen("yt-dlp -o \"") + strlen(filename) +
-      strlen(
-          ".mp4\" --recode-video mp4 --max-filesize 50M --embed-thumbnail \"") +
+      strlen("yt-dlp -f "
+             "'best[ext=mp4]/best' -o \"") +
+      strlen(output_path) +
+      strlen("\" --max-filesize 50M --download-sections \"*0-300\" \"") +
       strlen(url) + strlen("\"") + 1;
   char *command = context_alloc(command_size);
   snprintf(command, command_size,
-           "yt-dlp -o \"%s.mp4\" --recode-video mp4 --max-filesize 50M "
-           "--embed-thumbnail \"%s\"",
-           filename, url);
+           "yt-dlp -f 'best[ext=mp4]/best' -o "
+           "\"%s\" --max-filesize 50M "
+           "\"%s\"",
+           output_path, url);
+
   int status = system(command);
   if (status != 0) {
     printf("Failed to download video: %s\n", url);
@@ -73,6 +123,12 @@ void handle_url(const char *url, Message *message) {
   char *downloaded_file = context_alloc(strlen(filename) + strlen(".mp4") + 1);
   strcpy(downloaded_file, filename);
   strcat(downloaded_file, ".mp4");
+
+  // Get width and height
+  int width, height;
+  get_video_dimensions(downloaded_file, &width, &height);
+  printf("Width: %d, Height: %d\n", width, height);
+
   const char *const murl = method_url("sendVideo", "");
   curl_mime *mime = curl_mime_init(curl);
   curl_mimepart *part;
@@ -83,14 +139,6 @@ void handle_url(const char *url, Message *message) {
   part = curl_mime_addpart(mime);
   curl_mime_name(part, "chat_id");
   curl_mime_data(part, chat_id_str, CURL_ZERO_TERMINATED);
-
-  // Reply to message
-  // char reply_params[64];
-  // snprintf(reply_params, sizeof(reply_params), "{\"message_id\":%d}",
-  //          message->id);
-  // part = curl_mime_addpart(mime);
-  // curl_mime_name(part, "reply_parameters");
-  // curl_mime_data(part, reply_params, CURL_ZERO_TERMINATED);
 
   ;
   const char *username = message->from->username;
@@ -152,6 +200,18 @@ void handle_url(const char *url, Message *message) {
   curl_mime_name(part, "parse_mode");
   curl_mime_data(part, "MarkdownV2", CURL_ZERO_TERMINATED);
 
+  char width_str[6];
+  snprintf(width_str, sizeof(width_str), "%d", width);
+  part = curl_mime_addpart(mime);
+  curl_mime_name(part, "width");
+  curl_mime_data(part, width_str, CURL_ZERO_TERMINATED);
+
+  char height_str[6];
+  snprintf(height_str, sizeof(height_str), "%d", height);
+  part = curl_mime_addpart(mime);
+  curl_mime_name(part, "height");
+  curl_mime_data(part, height_str, CURL_ZERO_TERMINATED);
+
   // Add video file
   part = curl_mime_addpart(mime);
   curl_mime_name(part, "video");
@@ -189,12 +249,28 @@ void handle_url(const char *url, Message *message) {
   curl_easy_cleanup(delete_curl);
 }
 
+typedef struct {
+  char *data;
+  size_t size;
+} WriteData;
+
 size_t write_callback(char *ptr, size_t size, size_t nmemb, void *userdata) {
-  log_callback(ptr, size, nmemb, userdata);
-  json_object *obj = json_tokener_parse(ptr);
+  WriteData *write_data = (WriteData *)userdata;
+  write_data->data = context_realloc(write_data->data, write_data->size,
+                                     write_data->size + size * nmemb);
+  memcpy(write_data->data + write_data->size, ptr, size * nmemb);
+  write_data->size += size * nmemb;
+
+  return size * nmemb;
+};
+void parse_updates(char *data, size_t size) {
+  log_callback(data, size);
+  json_tokener *tokener = json_tokener_new();
+  json_object *obj = json_tokener_parse_ex(tokener, data, size);
+  json_tokener_free(tokener);
   json_object *updates = json_object_object_get(obj, "result");
   if (!json_object_is_type(updates, json_type_array)) {
-    return size * nmemb;
+    return;
     // updates = json_object_new_array();
     // json_object_array_add(updates, json_object_object_get(obj, "result"));
   }
@@ -282,8 +358,7 @@ size_t write_callback(char *ptr, size_t size, size_t nmemb, void *userdata) {
     json_object *update_id = json_object_object_get(update, "update_id");
     offset = json_object_get_uint64(update_id) + 1;
   }
-  return size * nmemb;
-};
+}
 
 static void atexit_handler() {
   context_free();
@@ -292,19 +367,17 @@ static void atexit_handler() {
 }
 
 int main(void) {
-  const char *env_token = getenv("GITHUB_TOKEN");
-  if (env_token) {
-    strcpy(token, env_token);
+  const char *env_token =
+      getenv("TELEGRAM_BOT_TOKEN"); // Changed to TELEGRAM_BOT_TOKEN
+  if (env_token != NULL) {
+    strncpy(token, env_token, TOKEN_LENGTH);
   } else {
-    FILE *f = fopen("token", "r");
-    if (!f) {
-      fprintf(stderr, "Failed to read token\n");
-      return EXIT_FAILURE;
-    }
-    fread(token, 1, 46, f);
-    fclose(f);
+    fprintf(stderr, "TELEGRAM_BOT_TOKEN environment variable not set.\n");
+    return EXIT_FAILURE;
   }
+
   sprintf(API_URL, "%s%s", API_URL_PREFIX, token);
+  printf("API URL: %s\n", API_URL);
   curl_global_init(CURL_GLOBAL_DEFAULT);
   curl = curl_easy_init();
   if (!curl) {
@@ -313,18 +386,23 @@ int main(void) {
   }
   atexit(atexit_handler);
   while (1) {
+    WriteData write_data = {0};
+    write_data.data = context_alloc(0);
+    write_data.size = 0;
     const char *const murl = method_url("getUpdates", "");
     curl_easy_setopt(curl, CURLOPT_URL, murl);
     curl_easy_setopt(curl, CURLOPT_POST, 1);
     char post_fields[100];
     sprintf(post_fields, "offset=%llu&limit=100&timeout=60", offset);
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, post_fields);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &write_data);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
     CURLcode res = curl_easy_perform(curl);
     if (res != CURLE_OK) {
       fprintf(stderr, "Failed to perform curl: %s\n", curl_easy_strerror(res));
       return EXIT_FAILURE;
     }
+    parse_updates(write_data.data, write_data.size);
     context_reset();
   }
   atexit_handler();
