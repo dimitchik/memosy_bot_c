@@ -379,6 +379,28 @@ int main(void) {
   sprintf(API_URL, "%s%s", API_URL_PREFIX, token);
   printf("API URL: %s\n", API_URL);
   curl_global_init(CURL_GLOBAL_DEFAULT);
+  const char *admin_chat_id = getenv("ADMIN_CHAT_ID");
+  if (admin_chat_id) {
+    CURL *update_notify_curl = curl_easy_init();
+    if (!update_notify_curl) {
+      fprintf(stderr, "Failed to initialize curl\n");
+      return EXIT_FAILURE;
+    }
+    const char *const update_notify_url = method_url("sendMessage", "");
+    curl_easy_setopt(update_notify_curl, CURLOPT_URL, update_notify_url);
+    char post_fields[100];
+    sprintf(post_fields, "chat_id=%s&text=Bot started successfully",
+            admin_chat_id);
+    curl_easy_setopt(update_notify_curl, CURLOPT_POSTFIELDS, post_fields);
+    CURLcode update_notify_res = curl_easy_perform(update_notify_curl);
+    if (update_notify_res != CURLE_OK) {
+      fprintf(stderr, "Failed to perform curl: %s\n",
+              curl_easy_strerror(update_notify_res));
+      return EXIT_FAILURE;
+    }
+    curl_easy_cleanup(update_notify_curl);
+  }
+
   curl = curl_easy_init();
   if (!curl) {
     fprintf(stderr, "Failed to initialize curl\n");
