@@ -344,12 +344,42 @@ void parse_updates(char *data, size_t size) {
           json_object_get_int(json_object_object_get(entity, "length"));
       message->entities[i].url =
           json_object_get_string(json_object_object_get(entity, "url"));
-      if (strcmp(message->entities[i].type, "text_link") == 0 ||
-          strcmp(message->entities[i].type, "url") == 0) {
-        char *download_url = context_alloc(message->entities[i].length + 1);
-        strncpy(download_url, message->text + message->entities[i].offset,
-                message->entities[i].length);
-        download_url[message->entities[i].length] = '\0';
+      if (strcmp(message->entities[i].type, "text_link") == 0) {
+        // For text_link entities, use the URL directly from the entity
+        if (message->entities[i].url != NULL) {
+          handle_url(message->entities[i].url, message);
+        }
+      } else if (strcmp(message->entities[i].type, "url") == 0) {
+        // For URL entities, we need to convert UTF-16 code units to UTF-8
+        // Allocate buffer for the URL
+        char *download_url =
+            context_alloc((message->entities[i].length * 4 + 1) * sizeof(char));
+
+        // Convert UTF-16 offsets to UTF-8 offsets
+        int utf8_offset = 0;
+        int utf16_pos = 0;
+        const char *text = message->text;
+
+        // Find the correct starting position in UTF-8
+        while (text[utf8_offset] && utf16_pos < message->entities[i].offset) {
+          // Skip continuation bytes (10xxxxxx)
+          if ((text[utf8_offset] & 0xC0) != 0x80) {
+            utf16_pos++;
+          }
+          utf8_offset++;
+        }
+
+        // Extract the URL with correct UTF-8 handling
+        int j = 0;
+        int utf16_len = 0;
+        while (text[utf8_offset] && utf16_len < message->entities[i].length) {
+          download_url[j++] = text[utf8_offset++];
+          // Count only non-continuation bytes toward UTF-16 length
+          if ((text[utf8_offset - 1] & 0xC0) != 0x80) {
+            utf16_len++;
+          }
+        }
+        download_url[j] = '\0';
 
         handle_url(download_url, message);
       }
